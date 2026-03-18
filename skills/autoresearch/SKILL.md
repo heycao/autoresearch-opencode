@@ -32,6 +32,9 @@ This is the heart of the session. A fresh agent with no context should be able t
 ## How to Run
 `./autoresearch.sh` — outputs `METRIC name=number` lines.
 
+## Sync Execution
+<Set to true only for interactive debugging. Default is async.>
+
 ## Files in Scope
 <Every file the agent may modify, with a brief note on what it does.>
 
@@ -76,18 +79,35 @@ Rules:
 Each experiment result is appended as a JSON line:
 
 ```json
-{"run":1,"commit":"abc1234","metric":42.3,"metrics":{"secondary_metric":123},"status":"keep","description":"baseline","timestamp":1234567890,"segment":0}
+{"run":1,"commit":"abc1234","metric":42.3,"duration":15.2,"metrics":{"secondary_metric":123},"status":"keep","description":"baseline","timestamp":1234567890,"segment":0}
 ```
 
 Fields:
 - `run`: sequential run number (1-indexed, across all segments)
 - `commit`: 7-char git short hash (the commit hash AFTER the auto-commit for keeps, or current HEAD for discard/crash)
 - `metric`: primary metric value (0 for crashes)
+- `duration`: wall-clock seconds the benchmark took (used for async threshold estimation)
 - `metrics`: object of secondary metric values — **once you start tracking a secondary metric, include it in every subsequent result**
 - `status`: `keep` | `discard` | `crash`
 - `description`: short description of what this experiment tried
 - `timestamp`: Unix epoch seconds
 - `segment`: current segment index
+
+### Job Lines
+
+When running in async mode, a job tracking entry is written before the benchmark starts:
+
+```json
+{"type":"job","pid":12345,"status":"running","started":1234567890}
+```
+
+After the benchmark completes, update the job entry (find by `pid`) and set `"status"` to `"completed"` or `"crashed"`.
+
+Fields:
+- `type`: `"job"`
+- `pid`: OS process ID of the background benchmark
+- `status`: `running` | `completed` | `crashed`
+- `started`: Unix epoch seconds when the job was launched
 
 ### Initialization (equivalent of `init_experiment`)
 
@@ -125,7 +145,7 @@ validate_jsonl() {
         
         # Verify last 5 lines are valid JSON
         tail -n 5 "$jsonl_file" 2>/dev/null | while IFS= read -r line; do
-            if ! echo "$line" | python3 -m json.tool >/dev/null 2>&1; then
+            if ! echo "$line" | uv run python -m json.tool >/dev/null 2>&1; then
                 echo "WARNING: Invalid JSON found in state file" >&2
                 return 1
             fi
@@ -160,7 +180,7 @@ write_jsonl_entry() {
     echo "$entry" >> "$temp_file"
     
     # Validate the new entry
-    if ! echo "$entry" | python3 -m json.tool >/dev/null 2>&1; then
+    if ! echo "$entry" | uv run python -m json.tool >/dev/null 2>&1; then
         rm -f "$temp_file"
         echo "  WARNING: Invalid JSON entry, not writing" >&2
         return 1
@@ -261,7 +281,41 @@ Add this warning banner to the dashboard when inconsistency is detected:
 
 ## Running Experiments (equivalent of `run_experiment`)
 
-Run the benchmark command, capturing timing and output:
+**Default is async.** Sync is only used when `autoresearch.md` contains `Sync Execution: true` or when historical average duration is under the auto-estimated threshold.
+
+### Mode Detection and Threshold
+
+```bash
+# 1. Check explicit sync override
+SYNC_MODE="false"
+if grep -q "Sync Execution: true" autoresearch.md 2>/dev/null; then
+    SYNC_MODE="true"
+fi
+
+# 2. Calculate historical average duration from JSONL
+AVG_DURATION=$(uv run python -c "
+import json
+durations = []
+with open('autoresearch.jsonl') as f:
+    for line in f:
+        try:
+            e = json.loads(line.strip())
+            if 'duration' in e and e.get('duration', 0) > 0:
+                durations.append(e['duration'])
+        except: pass
+print(sum(durations) / len(durations) if durations else 0)
+" 2>/dev/null || echo "0")
+
+# 3. Threshold: 10s default, then max(10, historical_avg) once we have data
+THRESHOLD=$(echo "$AVG_DURATION" | bc -l 2>/dev/null || echo "10")
+if (( $(echo "$THRESHOLD < 10" | bc -l 2>/dev/null || echo "1") )); then
+    THRESHOLD="10"
+fi
+
+echo "Mode detection: sync=$SYNC_MODE, avg_duration=${AVG_DURATION}s, threshold=${THRESHOLD}s"
+```
+
+### Sync Mode (interactive debugging)
 
 ```bash
 START_TIME=$(date +%s%N)
@@ -272,10 +326,66 @@ DURATION=$(echo "scale=3; ($END_TIME - $START_TIME) / 1000000000" | bc)
 echo "Duration: ${DURATION}s, Exit code: ${EXIT_CODE}"
 ```
 
-After running:
+### Async Mode (default)
+
+```bash
+# Launch benchmark in background
+nohup bash -c "./autoresearch.sh" > benchmark.log 2>&1 &
+BENCHMARK_PID=$!
+echo "Launched benchmark PID: $BENCHMARK_PID"
+
+# Log job to JSONL
+JOB_ENTRY="{\"type\":\"job\",\"pid\":$BENCHMARK_PID,\"status\":\"running\",\"started\":$(date +%s)}"
+echo "$JOB_ENTRY" >> autoresearch.jsonl
+
+# Record start time for duration
+START_TIME=$(date +%s%N)
+
+# Poll for completion (check every 10s)
+while kill -0 $BENCHMARK_PID 2>/dev/null; do
+    echo "Benchmark PID $BENCHMARK_PID still running... $(date)"
+    sleep 10
+done
+
+# Capture exit code and duration
+wait $BENCHMARK_PID
+EXIT_CODE=$?
+END_TIME=$(date +%s%N)
+DURATION=$(echo "scale=3; ($END_TIME - $START_TIME) / 1000000000" | bc)
+
+# Update job status in JSONL (replace running entry)
+uv run python -c "
+import json
+lines = []
+with open('autoresearch.jsonl') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            e = json.loads(line)
+            if e.get('type') == 'job' and e.get('pid') == $BENCHMARK_PID:
+                e['status'] = 'completed' if $EXIT_CODE == 0 else 'crashed'
+                lines.append(json.dumps(e))
+            else:
+                lines.append(line)
+        except: lines.append(line)
+with open('autoresearch.jsonl', 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+"
+
+# Display output
+echo "=== Benchmark Output ==="
+cat benchmark.log
+echo "=== End Output ==="
+echo "Duration: ${DURATION}s, Exit code: ${EXIT_CODE}"
+```
+
+### After Running (both modes)
+
 - Parse `METRIC name=number` lines from the output to extract metric values
 - If exit code != 0 → this is a crash
 - Read the output to understand what happened
+- Use the `DURATION` value when writing the result entry to JSONL
 
 ---
 
@@ -317,7 +427,7 @@ Use the current HEAD hash (before revert) as the commit field.
 ### 3. Append result to JSONL
 
 ```bash
-echo '{"run":<N>,"commit":"<hash>","metric":<value>,"metrics":{<secondaries>},"status":"<status>","description":"<desc>","timestamp":'$(date +%s)',"segment":<seg>}' >> autoresearch.jsonl
+echo '{"run":<N>,"commit":"<hash>","metric":<value>,"duration":<DURATION>,"metrics":{<secondaries>},"status":"<status>","description":"<desc>","timestamp":'$(date +%s)',"segment":<seg>}' >> autoresearch.jsonl
 ```
 
 ### 4. Update dashboard
